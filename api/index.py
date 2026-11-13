@@ -25,9 +25,12 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+# Giới hạn tối đa của Telegram Bot API khi gửi qua URL (~48MB để đảm bảo an toàn)
+TELEGRAM_MAX_BYTES = 48 * 1024 * 1024
+
 
 async def resolve_short_url(session: aiohttp.ClientSession, url: str) -> str:
-    """Mở rộng link rút gọn (vt.tiktok.com / vm.tiktok.com) thành link gốc."""
+    """Mở rộng link rút gọn thành link gốc."""
     if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
         try:
             async with session.get(
@@ -39,8 +42,22 @@ async def resolve_short_url(session: aiohttp.ClientSession, url: str) -> str:
     return url
 
 
+async def get_file_size(url: str) -> int:
+    """Kiểm tra dung lượng file (bytes) trước khi gửi sang Telegram."""
+    if not url:
+        return 0
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(
+                url, headers=HEADERS, allow_redirects=True, timeout=8
+            ) as resp:
+                return int(resp.headers.get("Content-Length", 0))
+    except Exception:
+        return 0
+
+
 async def fetch_tiktok_data(tiktok_url: str) -> tuple[dict | None, str]:
-    """Gọi API TikWM lấy dữ liệu video hoặc slideshow ảnh không watermark."""
+    """Gọi API TikWM lấy dữ liệu video hoặc slideshow ảnh."""
     api_url = "https://www.tikwm.com/api/"
 
     async with aiohttp.ClientSession() as session:
@@ -70,7 +87,7 @@ async def fetch_tiktok_data(tiktok_url: str) -> tuple[dict | None, str]:
 
 @app.get("/{full_path:path}")
 async def health_check(full_path: str = ""):
-    return {"status": "TikTok Video & Photo Downloader Bot is running!"}
+    return {"status": "TikTok Downloader Bot (Large File Ready) is running!"}
 
 
 @app.post("/{full_path:path}")
@@ -78,7 +95,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
     data = await request.json()
     update = Update.de_json(data, bot)
 
-    # 1. Xử lý khi bấm nút "Gửi file nhạc MP3"
+    # 1. Xử lý nút bấm gửi file nhạc MP3 trực tiếp
     if update.callback_query:
         query = update.callback_query
         await query.answer("⏳ Đang trích xuất nhạc MP3...")
@@ -93,12 +110,18 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 music_title = video_data.get("music_info", {}).get(
                     "title", "TikTok Audio"
                 )
-                await bot.send_audio(
-                    chat_id=query.message.chat_id,
-                    audio=music_url,
-                    title=music_title,
-                    caption="🎵 Nhạc nền gốc từ TikTok",
-                )
+                try:
+                    await bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=music_url,
+                        title=music_title,
+                        caption="🎵 Nhạc nền gốc từ TikTok",
+                    )
+                except Exception:
+                    await bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=f"🎵 File nhạc quá lớn (>50MB), tải trực tiếp tại đây:\n{music_url}",
+                    )
             else:
                 await bot.send_message(
                     chat_id=query.message.chat_id,
@@ -106,7 +129,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 )
         return {"ok": True}
 
-    # 2. Xử lý tin nhắn văn bản / link TikTok
+    # 2. Xử lý tin nhắn văn bản
     if not update.message or not update.message.text:
         return {"ok": True}
 
@@ -115,12 +138,10 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_msg = (
-            "👋 **Chào mừng bạn đến với Bot Tải Video & Ảnh TikTok Không Logo!**\n\n"
-            "📌 **Tính năng hỗ trợ:**\n"
-            "• Tải video TikTok HD không dính watermark\n"
-            "• Tải toàn bộ bộ ảnh (Slideshow / Photo Mode)\n"
-            "• Tách riêng file nhạc nền MP3\n\n"
-            "👉 Chỉ cần dán link TikTok vào đây để bắt đầu!"
+            "👋 **Bot Tải Video & Ảnh TikTok Không Logo**\n\n"
+            "• Tự động gửi thẳng video HD hoặc bộ ảnh vào khung chat.\n"
+            "• Tự động tối ưu chất lượng hoặc cấp link tải trực tiếp nếu video vượt quá 50MB.\n\n"
+            "👉 Dán link TikTok vào đây để bắt đầu!"
         )
         await bot.send_message(
             chat_id=chat_id, text=welcome_msg, parse_mode="Markdown"
@@ -137,7 +158,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     tiktok_url = match.group(1)
     status_msg = await bot.send_message(
-        chat_id=chat_id, text="⏳ Đang xử lý dữ liệu từ TikTok..."
+        chat_id=chat_id, text="⏳ Đang phân tích dung lượng và xử lý..."
     )
 
     media_data, error_msg = await fetch_tiktok_data(tiktok_url)
@@ -155,22 +176,10 @@ async def telegram_webhook(request: Request, full_path: str = ""):
     short_title = (title[:100] + "...") if len(title) > 100 else title
     caption = f"🎬 **{short_title}**\n👤 Tác giả: `{author}`"
 
-    reply_markup = None
-    if video_id and media_data.get("music"):
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    "🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}"
-                )
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(buttons)
-
-    # TRƯỜNG HỢP A: Bài đăng dạng Slideshow nhiều ảnh (Photo Mode)
+    # TRƯỜNG HỢP A: Bài đăng nhiều ảnh (Slideshow)
     images = media_data.get("images")
     if images and isinstance(images, list) and len(images) > 0:
         try:
-            # Telegram cho phép tối đa 10 ảnh mỗi album (Media Group), chia thành từng cụm 10 ảnh
             for i in range(0, len(images), 10):
                 chunk = images[i : i + 10]
                 media_group = []
@@ -185,20 +194,19 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                         )
                     else:
                         media_group.append(InputMediaPhoto(media=img_url))
-
                 await bot.send_media_group(chat_id=chat_id, media=media_group)
 
-            # Gửi thêm nút tải nhạc nền của slideshow (nếu có)
-            if reply_markup:
+            if video_id and media_data.get("music"):
+                btn = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]]
+                )
                 await bot.send_message(
                     chat_id=chat_id,
                     text=f"✅ Đã tải xong **{len(images)}** ảnh không logo!",
                     parse_mode="Markdown",
-                    reply_markup=reply_markup,
+                    reply_markup=btn,
                 )
-            await bot.delete_message(
-                chat_id=chat_id, message_id=status_msg.message_id
-            )
+            await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except Exception as e:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -207,38 +215,78 @@ async def telegram_webhook(request: Request, full_path: str = ""):
             )
         return {"ok": True}
 
-    # TRƯỜNG HỢP B: Bài đăng Video thông thường
-    hd_url = media_data.get("hdplay") or media_data.get("play")
-    standard_url = media_data.get("play")
+    # TRƯỜNG HỢP B: Bài đăng Video (Kiểm tra dung lượng trước để xử lý file > 50MB)
+    hd_url = media_data.get("hdplay")
+    sd_url = media_data.get("play")
 
-    try:
-        await bot.send_video(
-            chat_id=chat_id,
-            video=hd_url,
-            caption=caption,
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
+    hd_size = await get_file_size(hd_url)
+    sd_size = await get_file_size(sd_url)
+
+    # Xây dựng danh sách nút bấm đi kèm
+    buttons = []
+    if video_id and media_data.get("music"):
+        buttons.append(
+            [InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]
         )
-        await bot.delete_message(
-            chat_id=chat_id, message_id=status_msg.message_id
-        )
-    except Exception:
+
+    # Chọn luồng gửi tối ưu theo dung lượng thực tế
+    target_url = None
+    quality_note = ""
+
+    if hd_url and (0 < hd_size <= TELEGRAM_MAX_BYTES):
+        target_url = hd_url
+    elif sd_url and (0 < sd_size <= TELEGRAM_MAX_BYTES):
+        target_url = sd_url
+        if hd_size > TELEGRAM_MAX_BYTES:
+            size_mb = round(hd_size / (1024 * 1024), 1)
+            quality_note = f"\nℹ️ *Bản HD gốc nặng {size_mb}MB (>50MB) nên bot gửi bản tiêu chuẩn để phát trực tiếp.*"
+            buttons.insert(
+                0, [InlineKeyboardButton(f"📥 Tải bản HD gốc ({size_mb}MB)", url=hd_url)]
+            )
+    elif hd_size == 0 and sd_size == 0:
+        # Trường hợp server không trả về Content-Length, thử gửi trực tiếp
+        target_url = hd_url or sd_url
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    if target_url:
         try:
             await bot.send_video(
                 chat_id=chat_id,
-                video=standard_url,
-                caption=caption,
+                video=target_url,
+                caption=caption + quality_note,
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
             )
-            await bot.delete_message(
-                chat_id=chat_id, message_id=status_msg.message_id
-            )
+            await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            return {"ok": True}
         except Exception:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text="❌ Video này quá nặng (vượt giới hạn 50MB của Telegram) nên bot không thể gửi trực tiếp.",
-            )
+            # Nếu vẫn vượt quá giới hạn Telegram khi truyền tải, chuyển sang luồng tải trực tiếp bên dưới
+            pass
+
+    # TRƯỜNG HỢP C: Cả bản HD và bản SD đều > 50MB -> Cấp link tải thẳng tốc độ cao (không giới hạn MB)
+    best_url = hd_url or sd_url
+    final_size_mb = round(max(hd_size, sd_size) / (1024 * 1024), 1)
+    size_text = f" ({final_size_mb}MB)" if final_size_mb > 0 else " (>50MB)"
+
+    fallback_buttons = [
+        [InlineKeyboardButton(f"⬇️ Tải Video Gốc Không Logo{size_text}", url=best_url)]
+    ]
+    if video_id and media_data.get("music"):
+        fallback_buttons.append(
+            [InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]
+        )
+
+    await bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=status_msg.message_id,
+        text=(
+            f"{caption}\n\n"
+            f"⚠️ **Video vượt quá giới hạn 50MB của Telegram{size_text}.**\n"
+            f"Bấm nút bên dưới để tải trực tiếp file gốc không logo về máy:"
+        ),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(fallback_buttons),
+    )
 
     return {"ok": True}
