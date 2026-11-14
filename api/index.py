@@ -178,7 +178,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     tiktok_url = match.group(1)
     status_msg = await bot.send_message(
-        chat_id=chat_id, text="⏳ Đang phân tích dung lượng và xử lý..."
+        chat_id=chat_id, text="⏳ Đang xử lí..."
     )
 
     media_data, error_msg = await fetch_tiktok_data(tiktok_url)
