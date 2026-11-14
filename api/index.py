@@ -25,8 +25,26 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# Giới hạn tối đa của Telegram Bot API khi gửi qua URL (~48MB để đảm bảo an toàn)
 TELEGRAM_MAX_BYTES = 48 * 1024 * 1024
+
+
+def normalize_media_url(url: str | None) -> str | None:
+    """Đảm bảo link media luôn có đầy đủ giao thức https://"""
+    if not url:
+        return None
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return "https://www.tikwm.com" + url
+    return url
+
+
+async def delete_user_message_safe(chat_id: int, message_id: int) -> None:
+    """Tự động xóa tin nhắn chứa link của người dùng (bỏ qua nếu thiếu quyền trong group)."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
 
 
 async def resolve_short_url(session: aiohttp.ClientSession, url: str) -> str:
@@ -42,7 +60,7 @@ async def resolve_short_url(session: aiohttp.ClientSession, url: str) -> str:
     return url
 
 
-async def get_file_size(url: str) -> int:
+async def get_file_size(url: str | None) -> int:
     """Kiểm tra dung lượng file (bytes) trước khi gửi sang Telegram."""
     if not url:
         return 0
@@ -87,7 +105,7 @@ async def fetch_tiktok_data(tiktok_url: str) -> tuple[dict | None, str]:
 
 @app.get("/{full_path:path}")
 async def health_check(full_path: str = ""):
-    return {"status": "TikTok Downloader Bot (Large File Ready) is running!"}
+    return {"status": "TikTok Downloader Bot (Auto-Clean Link) is running!"}
 
 
 @app.post("/{full_path:path}")
@@ -105,8 +123,8 @@ async def telegram_webhook(request: Request, full_path: str = ""):
             tiktok_url = f"https://www.tiktok.com/@tiktok/video/{video_id}"
             video_data, _ = await fetch_tiktok_data(tiktok_url)
 
-            if video_data and video_data.get("music"):
-                music_url = video_data["music"]
+            music_url = normalize_media_url(video_data.get("music")) if video_data else None
+            if music_url:
                 music_title = video_data.get("music_info", {}).get(
                     "title", "TikTok Audio"
                 )
@@ -134,13 +152,15 @@ async def telegram_webhook(request: Request, full_path: str = ""):
         return {"ok": True}
 
     chat_id = update.message.chat_id
+    user_msg_id = update.message.message_id
     text = update.message.text.strip()
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_msg = (
             "👋 **Bot Tải Video & Ảnh TikTok Không Logo**\n\n"
             "• Tự động gửi thẳng video HD hoặc bộ ảnh vào khung chat.\n"
-            "• Tự động tối ưu chất lượng hoặc cấp link tải trực tiếp nếu video vượt quá 50MB.\n\n"
+            "• Tự động xóa tin nhắn link sau khi gửi xong để giữ khung chat gọn gàng.\n"
+            "• Tự động tối ưu chất lượng hoặc cấp link tải trực tiếp nếu video > 50MB.\n\n"
             "👉 Dán link TikTok vào đây để bắt đầu!"
         )
         await bot.send_message(
@@ -183,7 +203,8 @@ async def telegram_webhook(request: Request, full_path: str = ""):
             for i in range(0, len(images), 10):
                 chunk = images[i : i + 10]
                 media_group = []
-                for idx, img_url in enumerate(chunk):
+                for idx, raw_img_url in enumerate(chunk):
+                    img_url = normalize_media_url(raw_img_url)
                     if i == 0 and idx == 0:
                         media_group.append(
                             InputMediaPhoto(
@@ -206,7 +227,9 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                     parse_mode="Markdown",
                     reply_markup=btn,
                 )
+            # Xóa cả thông báo "Đang xử lý..." và tin nhắn chứa link của người dùng
             await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            await delete_user_message_safe(chat_id, user_msg_id)
         except Exception as e:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -216,20 +239,18 @@ async def telegram_webhook(request: Request, full_path: str = ""):
         return {"ok": True}
 
     # TRƯỜNG HỢP B: Bài đăng Video (Kiểm tra dung lượng trước để xử lý file > 50MB)
-    hd_url = media_data.get("hdplay")
-    sd_url = media_data.get("play")
+    hd_url = normalize_media_url(media_data.get("hdplay"))
+    sd_url = normalize_media_url(media_data.get("play"))
 
     hd_size = await get_file_size(hd_url)
     sd_size = await get_file_size(sd_url)
 
-    # Xây dựng danh sách nút bấm đi kèm
     buttons = []
     if video_id and media_data.get("music"):
         buttons.append(
             [InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]
         )
 
-    # Chọn luồng gửi tối ưu theo dung lượng thực tế
     target_url = None
     quality_note = ""
 
@@ -244,7 +265,6 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 0, [InlineKeyboardButton(f"📥 Tải bản HD gốc ({size_mb}MB)", url=hd_url)]
             )
     elif hd_size == 0 and sd_size == 0:
-        # Trường hợp server không trả về Content-Length, thử gửi trực tiếp
         target_url = hd_url or sd_url
 
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
@@ -258,13 +278,14 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
             )
+            # Xóa cả thông báo "Đang xử lý..." và tin nhắn chứa link của người dùng
             await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            await delete_user_message_safe(chat_id, user_msg_id)
             return {"ok": True}
         except Exception:
-            # Nếu vẫn vượt quá giới hạn Telegram khi truyền tải, chuyển sang luồng tải trực tiếp bên dưới
             pass
 
-    # TRƯỜNG HỢP C: Cả bản HD và bản SD đều > 50MB -> Cấp link tải thẳng tốc độ cao (không giới hạn MB)
+    # TRƯỜNG HỢP C: Cả bản HD và bản SD đều > 50MB -> Cấp link tải thẳng tốc độ cao
     best_url = hd_url or sd_url
     final_size_mb = round(max(hd_size, sd_size) / (1024 * 1024), 1)
     size_text = f" ({final_size_mb}MB)" if final_size_mb > 0 else " (>50MB)"
@@ -288,5 +309,6 @@ async def telegram_webhook(request: Request, full_path: str = ""):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(fallback_buttons),
     )
+    await delete_user_message_safe(chat_id, user_msg_id)
 
     return {"ok": True}
