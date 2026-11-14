@@ -179,11 +179,8 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_msg = (
-            "👋 **Bot Tải Video & Ảnh TikTok Không Logo**\n\n"
-            "• Tự động gửi thẳng video HD hoặc bộ ảnh vào khung chat.\n"
-            "• Tự động xóa tin nhắn link sau khi gửi xong để giữ khung chat gọn gàng.\n"
-            "• Tự động tối ưu chất lượng hoặc cấp link tải trực tiếp nếu video > 50MB.\n\n"
-            "👉 Dán link TikTok vào đây để bắt đầu!"
+            "👋 **BOT ĐƯỢC CODE BỞI NGUYỄN HOÀNG PHÚC**\n\n"
+            "• Gửi link tiktok cần tải vào khung chat .\n"
         )
         await bot.send_message(
             chat_id=chat_id, text=welcome_msg, parse_mode="Markdown"
@@ -194,7 +191,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
     if not match:
         await bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Vui lòng gửi đường link TikTok hợp lệ.",
+            text="⚠️ Vui lòng gửi đường link hợp lệ.",
         )
         return {"ok": True}
 
