@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import html
 import asyncio
 import aiohttp
 from fastapi import FastAPI, Request
@@ -16,13 +18,18 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 app = FastAPI()
 bot = Bot(token=TELEGRAM_TOKEN)
 
+# Regex nhận diện link TikTok và Facebook
 TIKTOK_URL_PATTERN = re.compile(
     r"(https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s]+)"
+)
+FACEBOOK_URL_PATTERN = re.compile(
+    r"(https?://(?:www\.|m\.|web\.|mbasic\.)?(?:facebook\.com|fb\.watch|fb\.com)/[^\s]+)"
 )
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 TELEGRAM_MAX_BYTES = 48 * 1024 * 1024
@@ -47,9 +54,11 @@ async def delete_user_message_safe(chat_id: int, message_id: int) -> None:
         pass
 
 
-async def marquee_status_animation(chat_id: int, message_id: int) -> None:
+async def marquee_status_animation(
+    chat_id: int, message_id: int, label: str = "Đang xử lí..."
+) -> None:
     """Tạo hiệu ứng chữ chạy ngang như bảng hiệu LED trong lúc chờ xử lý."""
-    banner = "⏳ Đang xử lí...   "
+    banner = f"⏳ {label}   "
     idx = 0
     try:
         while True:
@@ -69,17 +78,15 @@ async def marquee_status_animation(chat_id: int, message_id: int) -> None:
         pass
 
 
-async def resolve_short_url(session: aiohttp.ClientSession, url: str) -> str:
-    """Mở rộng link rút gọn thành link gốc."""
-    if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
-        try:
-            async with session.get(
-                url, headers=HEADERS, allow_redirects=True, timeout=10
-            ) as resp:
-                return str(resp.url).split("?")[0]
-        except Exception:
-            return url
-    return url
+async def resolve_redirect_url(session: aiohttp.ClientSession, url: str) -> str:
+    """Mở rộng link rút gọn (vt.tiktok.com, fb.watch, facebook.com/share/...) thành link gốc."""
+    try:
+        async with session.get(
+            url, headers=HEADERS, allow_redirects=True, timeout=12
+        ) as resp:
+            return str(resp.url)
+    except Exception:
+        return url
 
 
 async def get_file_size(url: str | None) -> int:
@@ -96,12 +103,108 @@ async def get_file_size(url: str | None) -> int:
         return 0
 
 
+def _clean_fb_url(raw: str) -> str:
+    """Giải mã các ký tự escape JSON/HTML trong link video Facebook."""
+    cleaned = raw.replace("\\/", "/").replace("\\u0025", "%")
+    try:
+        cleaned = json.loads(f'"{cleaned}"')
+    except Exception:
+        pass
+    return html.unescape(cleaned)
+
+
+async def fetch_facebook_data(fb_url: str) -> tuple[dict | None, str]:
+    """Trích xuất link video HD/SD trực tiếp từ bài đăng Facebook công khai."""
+    fb_headers = {
+        **HEADERS,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        resolved_url = await resolve_redirect_url(session, fb_url)
+        clean_url = resolved_url.split("?")[0] if "/reel/" in resolved_url else resolved_url
+
+        html_sources = []
+        # Thử lấy HTML từ trang gốc và trang nhúng video plugin của Facebook
+        target_pages = [
+            clean_url,
+            f"https://www.facebook.com/plugins/video.php?href={clean_url}",
+        ]
+
+        for page_url in target_pages:
+            try:
+                async with session.get(
+                    page_url, headers=fb_headers, allow_redirects=True, timeout=15
+                ) as resp:
+                    if resp.status == 200:
+                        text = await resp.text(errors="ignore")
+                        html_sources.append(text)
+            except Exception:
+                continue
+
+        hd_url = None
+        sd_url = None
+        title = "Video Facebook"
+
+        for page_html in html_sources:
+            if not hd_url:
+                for pattern in [
+                    r'"browser_native_hd_url"\s*:\s*"([^"]+)"',
+                    r'"playable_url_quality_hd"\s*:\s*"([^"]+)"',
+                    r'"hd_src"\s*:\s*"([^"]+)"',
+                ]:
+                    m = re.search(pattern, page_html)
+                    if m:
+                        hd_url = _clean_fb_url(m.group(1))
+                        break
+
+            if not sd_url:
+                for pattern in [
+                    r'"browser_native_sd_url"\s*:\s*"([^"]+)"',
+                    r'"playable_url"\s*:\s*"([^"]+)"',
+                    r'"sd_src"\s*:\s*"([^"]+)"',
+                ]:
+                    m = re.search(pattern, page_html)
+                    if m:
+                        sd_url = _clean_fb_url(m.group(1))
+                        break
+
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', page_html, re.S)
+            if title_match:
+                raw_title = html.unescape(re.sub(r"<[^>]+>", "", title_match.group(1))).strip()
+                if raw_title and "facebook" not in raw_title.lower():
+                    title = raw_title
+
+            if hd_url or sd_url:
+                break
+
+        if not hd_url and not sd_url:
+            return (
+                None,
+                "Không tìm thấy luồng video. Video có thể ở chế độ riêng tư/nhóm kín hoặc link không hợp lệ.",
+            )
+
+        return {
+            "platform": "Facebook",
+            "title": title,
+            "author": "Facebook Video",
+            "hdplay": hd_url,
+            "play": sd_url or hd_url,
+            "id": None,
+            "music": None,
+            "images": None,
+        }, ""
+
+
 async def fetch_tiktok_data(tiktok_url: str) -> tuple[dict | None, str]:
-    """Gọi API TikWM lấy dữ liệu video hoặc slideshow ảnh."""
+    """Gọi API TikWM lấy dữ liệu video hoặc slideshow ảnh TikTok."""
     api_url = "https://www.tikwm.com/api/"
 
     async with aiohttp.ClientSession() as session:
-        clean_url = await resolve_short_url(session, tiktok_url)
+        resolved = await resolve_redirect_url(session, tiktok_url)
+        clean_url = resolved.split("?")[0]
         payload = {"url": clean_url, "hd": 1}
 
         for _ in range(3):
@@ -114,7 +217,9 @@ async def fetch_tiktok_data(tiktok_url: str) -> tuple[dict | None, str]:
                         continue
                     result = await response.json()
                     if result.get("code") == 0 and result.get("data"):
-                        return result["data"], ""
+                        data = result["data"]
+                        data["platform"] = "TikTok"
+                        return data, ""
                     if "limit" in str(result.get("msg", "")).lower():
                         await asyncio.sleep(1.2)
                         continue
@@ -127,7 +232,7 @@ async def fetch_tiktok_data(tiktok_url: str) -> tuple[dict | None, str]:
 
 @app.get("/{full_path:path}")
 async def health_check(full_path: str = ""):
-    return {"status": "TikTok Downloader Bot (Marquee Effect) is running!"}
+    return {"status": "TikTok & Facebook Downloader Bot is running!"}
 
 
 @app.post("/{full_path:path}")
@@ -135,7 +240,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
     data = await request.json()
     update = Update.de_json(data, bot)
 
-    # 1. Xử lý nút bấm gửi file nhạc MP3 trực tiếp
+    # 1. Xử lý nút bấm gửi file nhạc MP3 trực tiếp (TikTok)
     if update.callback_query:
         query = update.callback_query
         await query.answer("⏳ Đang trích xuất nhạc MP3...")
@@ -145,7 +250,9 @@ async def telegram_webhook(request: Request, full_path: str = ""):
             tiktok_url = f"https://www.tiktok.com/@tiktok/video/{video_id}"
             video_data, _ = await fetch_tiktok_data(tiktok_url)
 
-            music_url = normalize_media_url(video_data.get("music")) if video_data else None
+            music_url = (
+                normalize_media_url(video_data.get("music")) if video_data else None
+            )
             if music_url:
                 music_title = video_data.get("music_info", {}).get(
                     "title", "TikTok Audio"
@@ -179,35 +286,45 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_msg = (
-            "👋 **BOT ĐƯỢC CODE BỞI NGUYỄN HOÀNG PHÚC**\n\n"
-            "• Gửi link tiktok cần tải vào khung chat .\n"
+            "👋 **Bot Tải Video TikTok & Facebook Đa Năng**\n\n"
+            "• **TikTok:** Tải video HD không logo, tải bộ ảnh (Slideshow) & tách nhạc MP3.\n"
+            "• **Facebook:** Hỗ trợ link Reels, Watch, `fb.watch`, video bài đăng công khai.\n"
+            "• Tự động xóa tin nhắn link sau khi gửi xong & hỗ trợ file > 50MB.\n\n"
+            "👉 Dán link TikTok hoặc Facebook vào đây để bắt đầu!"
         )
         await bot.send_message(
             chat_id=chat_id, text=welcome_msg, parse_mode="Markdown"
         )
         return {"ok": True}
 
-    match = TIKTOK_URL_PATTERN.search(text)
-    if not match:
+    # Phát hiện nền tảng từ link người dùng gửi
+    tiktok_match = TIKTOK_URL_PATTERN.search(text)
+    fb_match = FACEBOOK_URL_PATTERN.search(text)
+
+    if not tiktok_match and not fb_match:
         await bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Vui lòng gửi đường link hợp lệ.",
+            text="⚠️ Vui lòng gửi đường link **TikTok** hoặc **Facebook** hợp lệ.",
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
-    tiktok_url = match.group(1)
+    platform_label = "Đang tải TikTok..." if tiktok_match else "Đang tải Facebook..."
     status_msg = await bot.send_message(
         chat_id=chat_id,
-        text="`⏳ Đang xử lí...   `",
+        text=f"`⏳ {platform_label}   `",
         parse_mode="Markdown",
     )
-    # Bắt đầu chạy hiệu ứng bảng hiệu song song
     anim_task = asyncio.create_task(
-        marquee_status_animation(chat_id, status_msg.message_id)
+        marquee_status_animation(chat_id, status_msg.message_id, platform_label)
     )
 
     try:
-        media_data, error_msg = await fetch_tiktok_data(tiktok_url)
+        if tiktok_match:
+            media_data, error_msg = await fetch_tiktok_data(tiktok_match.group(1))
+        else:
+            media_data, error_msg = await fetch_facebook_data(fb_match.group(1))
+
         if not media_data:
             anim_task.cancel()
             await bot.edit_message_text(
@@ -217,13 +334,20 @@ async def telegram_webhook(request: Request, full_path: str = ""):
             )
             return {"ok": True}
 
+        platform = media_data.get("platform", "Video")
         video_id = media_data.get("id")
-        title = media_data.get("title") or "Bài đăng TikTok"
-        author = media_data.get("author", {}).get("nickname", "Unknown")
-        short_title = (title[:100] + "...") if len(title) > 100 else title
-        caption = f"🎬 **{short_title}**\n👤 Tác giả: `{author}`"
+        title = media_data.get("title") or f"Video {platform}"
+        raw_author = media_data.get("author")
+        author = (
+            raw_author.get("nickname", "Unknown")
+            if isinstance(raw_author, dict)
+            else (raw_author or platform)
+        )
 
-        # TRƯỜNG HỢP A: Bài đăng nhiều ảnh (Slideshow)
+        short_title = (title[:100] + "...") if len(title) > 100 else title
+        caption = f"🎬 **[{platform}]** {short_title}\n👤 Nguồn: `{author}`"
+
+        # TRƯỜNG HỢP A: Bài đăng nhiều ảnh (Slideshow TikTok)
         images = media_data.get("images")
         if images and isinstance(images, list) and len(images) > 0:
             try:
@@ -246,7 +370,14 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
                 if video_id and media_data.get("music"):
                     btn = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]]
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🎵 Gửi file nhạc MP3",
+                                    callback_data=f"mp3|{video_id}",
+                                )
+                            ]
+                        ]
                     )
                     await bot.send_message(
                         chat_id=chat_id,
@@ -255,7 +386,9 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                         reply_markup=btn,
                     )
                 anim_task.cancel()
-                await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+                await bot.delete_message(
+                    chat_id=chat_id, message_id=status_msg.message_id
+                )
                 await delete_user_message_safe(chat_id, user_msg_id)
             except Exception as e:
                 anim_task.cancel()
@@ -266,7 +399,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 )
             return {"ok": True}
 
-        # TRƯỜNG HỢP B: Bài đăng Video
+        # TRƯỜNG HỢP B: Bài đăng Video (TikTok hoặc Facebook)
         hd_url = normalize_media_url(media_data.get("hdplay"))
         sd_url = normalize_media_url(media_data.get("play"))
 
@@ -276,7 +409,11 @@ async def telegram_webhook(request: Request, full_path: str = ""):
         buttons = []
         if video_id and media_data.get("music"):
             buttons.append(
-                [InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]
+                [
+                    InlineKeyboardButton(
+                        "🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}"
+                    )
+                ]
             )
 
         target_url = None
@@ -290,7 +427,12 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 size_mb = round(hd_size / (1024 * 1024), 1)
                 quality_note = f"\nℹ️ *Bản HD gốc nặng {size_mb}MB (>50MB) nên bot gửi bản tiêu chuẩn để phát trực tiếp.*"
                 buttons.insert(
-                    0, [InlineKeyboardButton(f"📥 Tải bản HD gốc ({size_mb}MB)", url=hd_url)]
+                    0,
+                    [
+                        InlineKeyboardButton(
+                            f"📥 Tải bản HD gốc ({size_mb}MB)", url=hd_url
+                        )
+                    ],
                 )
         elif hd_size == 0 and sd_size == 0:
             target_url = hd_url or sd_url
@@ -307,11 +449,30 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                     reply_markup=reply_markup,
                 )
                 anim_task.cancel()
-                await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+                await bot.delete_message(
+                    chat_id=chat_id, message_id=status_msg.message_id
+                )
                 await delete_user_message_safe(chat_id, user_msg_id)
                 return {"ok": True}
             except Exception:
-                pass
+                # Dự phòng: Nếu gửi bản HD thất bại (ví dụ do vượt dung lượng khi server không báo size), thử lại bằng bản SD
+                if sd_url and target_url != sd_url:
+                    try:
+                        await bot.send_video(
+                            chat_id=chat_id,
+                            video=sd_url,
+                            caption=caption,
+                            parse_mode="Markdown",
+                            reply_markup=reply_markup,
+                        )
+                        anim_task.cancel()
+                        await bot.delete_message(
+                            chat_id=chat_id, message_id=status_msg.message_id
+                        )
+                        await delete_user_message_safe(chat_id, user_msg_id)
+                        return {"ok": True}
+                    except Exception:
+                        pass
 
         # TRƯỜNG HỢP C: Video > 50MB -> Cấp link tải thẳng
         best_url = hd_url or sd_url
@@ -319,11 +480,15 @@ async def telegram_webhook(request: Request, full_path: str = ""):
         size_text = f" ({final_size_mb}MB)" if final_size_mb > 0 else " (>50MB)"
 
         fallback_buttons = [
-            [InlineKeyboardButton(f"⬇️ Tải Video Gốc Không Logo{size_text}", url=best_url)]
+            [InlineKeyboardButton(f"⬇️ Tải Video Gốc{size_text}", url=best_url)]
         ]
         if video_id and media_data.get("music"):
             fallback_buttons.append(
-                [InlineKeyboardButton("🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}")]
+                [
+                    InlineKeyboardButton(
+                        "🎵 Gửi file nhạc MP3", callback_data=f"mp3|{video_id}"
+                    )
+                ]
             )
 
         anim_task.cancel()
@@ -333,7 +498,7 @@ async def telegram_webhook(request: Request, full_path: str = ""):
             text=(
                 f"{caption}\n\n"
                 f"⚠️ **Video vượt quá giới hạn 50MB của Telegram{size_text}.**\n"
-                f"Bấm nút bên dưới để tải trực tiếp file gốc không logo về máy:"
+                f"Bấm nút bên dưới để tải trực tiếp file gốc về máy:"
             ),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(fallback_buttons),
