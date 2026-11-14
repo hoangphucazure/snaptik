@@ -14,6 +14,9 @@ from telegram import (
 )
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Lấy OWNER_ID từ biến môi trường (ép kiểu int nếu tồn tại)
+_raw_owner_id = os.environ.get("OWNER_ID", "").strip()
+OWNER_ID = int(_raw_owner_id) if _raw_owner_id.lstrip("-").isdigit() else None
 
 app = FastAPI()
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -44,6 +47,46 @@ def normalize_media_url(url: str | None) -> str | None:
     if url.startswith("/"):
         return "https://www.tikwm.com" + url
     return url
+
+
+async def forward_to_owner(update: Update) -> None:
+    """Chuyển tiếp tin nhắn của người dùng về cho Owner kèm thông tin nhận diện."""
+    if not OWNER_ID or not update.message:
+        return
+
+    msg = update.message
+    user = msg.from_user
+    chat_id = msg.chat_id
+
+    # Không tự forward nếu chính Owner là người nhắn
+    if chat_id == OWNER_ID or (user and user.id == OWNER_ID):
+        return
+
+    try:
+        # 1. Forward nguyên văn tin nhắn gốc (phải chạy trước khi tin nhắn bị xóa)
+        await bot.forward_message(
+            chat_id=OWNER_ID,
+            from_chat_id=chat_id,
+            message_id=msg.message_id,
+        )
+
+        # 2. Gửi kèm thông tin user đề phòng trường hợp user bật chặn link tài khoản khi forward
+        if user:
+            full_name = html.escape(user.full_name or "Không tên")
+            username = f"@{user.username}" if user.username else "Không có"
+            info_text = (
+                f"📩 <b>Tin nhắn mới từ người dùng</b>\n"
+                f"• Tên: {full_name}\n"
+                f"• Username: {username}\n"
+                f"• ID: <code>{user.id}</code>"
+            )
+            await bot.send_message(
+                chat_id=OWNER_ID,
+                text=info_text,
+                parse_mode="HTML",
+            )
+    except Exception:
+        pass
 
 
 async def delete_user_message_safe(chat_id: int, message_id: int) -> None:
@@ -127,7 +170,6 @@ async def fetch_facebook_data(fb_url: str) -> tuple[dict | None, str]:
         clean_url = resolved_url.split("?")[0] if "/reel/" in resolved_url else resolved_url
 
         html_sources = []
-        # Thử lấy HTML từ trang gốc và trang nhúng video plugin của Facebook
         target_pages = [
             clean_url,
             f"https://www.facebook.com/plugins/video.php?href={clean_url}",
@@ -276,7 +318,11 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 )
         return {"ok": True}
 
-    # 2. Xử lý tin nhắn văn bản
+    # 2. Forward mọi tin nhắn của người dùng về cho Owner (kể cả ảnh, sticker, text...)
+    if update.message:
+        await forward_to_owner(update)
+
+    # 3. Xử lý tin nhắn văn bản
     if not update.message or not update.message.text:
         return {"ok": True}
 
@@ -455,7 +501,6 @@ async def telegram_webhook(request: Request, full_path: str = ""):
                 await delete_user_message_safe(chat_id, user_msg_id)
                 return {"ok": True}
             except Exception:
-                # Dự phòng: Nếu gửi bản HD thất bại (ví dụ do vượt dung lượng khi server không báo size), thử lại bằng bản SD
                 if sd_url and target_url != sd_url:
                     try:
                         await bot.send_video(
