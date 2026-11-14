@@ -286,11 +286,11 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_msg = (
-            "👋 **Bot Tải Video TikTok & Facebook**\n\n"
+            " **Bot Tải Video TikTok & Facebook**\n\n"
             "• **TikTok:** Tải video HD không logo, tải bộ ảnh (Slideshow) & tách nhạc MP3.\n"
             "• **Facebook:** Hỗ trợ link Reels, Watch, `fb.watch`, video bài đăng công khai.\n"
             "• Bot của Nguyễn Hoàng Phúc \n\n"
-            "👉 Dán link TikTok hoặc Facebook vào đây để bắt đầu!"
+            "👇 Dán link TikTok hoặc Facebook vào chat để tải ngay!"
         )
         await bot.send_message(
             chat_id=chat_id, text=welcome_msg, parse_mode="Markdown"
