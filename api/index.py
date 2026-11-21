@@ -233,7 +233,7 @@ async def fetch_facebook_data(fb_url: str) -> tuple[dict | None, str]:
         return {
             "platform": "Facebook",
             "title": title,
-            "author": "Facebook Video",
+            "author": "Không xác định",
             "hdplay": hd_url,
             "play": sd_url or hd_url,
             "id": None,
@@ -496,13 +496,13 @@ async def telegram_webhook(request: Request, full_path: str = ""):
 
     if text.startswith("/start") or text.startswith("/help"):
         welcome_msg = (
-            "🤖 **Bot Tải Video Đa Nền Tảng**\n\n"
+            "🤖 **Bot Tải Video**\n\n"
             "• **TikTok:** Tải video HD không logo, tải bộ ảnh (Slideshow) & tách nhạc MP3.\n"
             "• **Facebook:** Hỗ trợ link Reels, Watch, `fb.watch`, video bài đăng công khai.\n"
-            "• **Instagram:** Tải Reels, video bài đăng & album ảnh (Carousel).\n"
-            "• **YouTube:** Tải video, YouTube Shorts & trích xuất âm thanh.\n"
+            "• **Instagram:** Bảo trì.\n"
+            "• **YouTube:** Bảo trì.\n"
             "• Bot của Nguyễn Hoàng Phúc\n\n"
-            "👇 Dán link **TikTok, Facebook, Instagram** hoặc **YouTube** vào chat để tải ngay!"
+            "👇 Dán link **TikTok, Facebook vào chat để tải ngay!"
         )
         await bot.send_message(
             chat_id=chat_id, text=welcome_msg, parse_mode="Markdown"
@@ -518,19 +518,19 @@ async def telegram_webhook(request: Request, full_path: str = ""):
     if not any([tiktok_match, fb_match, ig_match, yt_match]):
         await bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Vui lòng gửi đường link **TikTok, Facebook, Instagram** hoặc **YouTube** hợp lệ.",
+            text="⚠️ Vui lòng gửi đường link hợp lệ.",
             parse_mode="Markdown",
         )
         return {"ok": True}
 
     if tiktok_match:
-        platform_label = "Đang tải TikTok..."
+        platform_label = "Đã phát hiện link TikTok..."
     elif fb_match:
-        platform_label = "Đang tải Facebook..."
+        platform_label = "Đã phát hiện link Facebook..."
     elif ig_match:
-        platform_label = "Đang tải Instagram..."
+        platform_label = Đang bảo trì"
     else:
-        platform_label = "Đang tải YouTube..."
+        platform_label = "Đang bảo trì"
 
     status_msg = await bot.send_message(
         chat_id=chat_id,
